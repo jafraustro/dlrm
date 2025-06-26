@@ -122,7 +122,8 @@ exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 def time_wrap(use_gpu):
     if use_gpu:
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
+        torch.xpu.synchronize()
     return time.time()
 
 
@@ -633,7 +634,8 @@ class DLRM_Net(nn.Module):
             t_list = []
             w_list = []
             for k, emb in enumerate(self.emb_l):
-                d = torch.device("cuda:" + str(k % ndevices))
+                # d = torch.device("cuda:" + str(k % ndevices))
+                d = torch.device(f'{acc}:' + str(k % ndevices))
                 t_list.append(emb.to(d))
                 if self.weighted_pooling == "learned":
                     w_list.append(Parameter(self.v_W_l[k].to(d)))
@@ -659,7 +661,7 @@ class DLRM_Net(nn.Module):
         t_list = []
         i_list = []
         for k, _ in enumerate(self.emb_l):
-            d = torch.device("cuda:" + str(k % ndevices))
+            d = torch.device(f'{acc}:' + str(k % ndevices))
             t_list.append(lS_o[k].to(d))
             i_list.append(lS_i[k].to(d))
         lS_o = t_list
@@ -692,7 +694,7 @@ class DLRM_Net(nn.Module):
 
         t_list = []
         for k, _ in enumerate(self.emb_l):
-            d = torch.device("cuda:" + str(k % ndevices))
+            d = torch.device(f'{acc}:' + str(k % ndevices))
             y = scatter(ly[k], device_ids, dim=0)
             t_list.append(y)
         # adjust the list to be ordered per device
@@ -799,8 +801,10 @@ def inference(
         ### gather the distributed results on each rank ###
         # For some reason it requires explicit sync before all_gather call if
         # tensor is on GPU memory
-        if Z_test.is_cuda:
-            torch.cuda.synchronize()
+        # if Z_test.is_cuda:
+        #     torch.cuda.synchronize()
+        if Z_test.is_xpu:
+            torch.xpu.synchronize()
         (_, batch_split_lengths) = ext_dist.get_split_lengths(X_test.size(0))
         if ext_dist.my_size > 1:
             Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
@@ -987,7 +991,7 @@ def run():
     # onnx
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
-    parser.add_argument("--use-gpu", action="store_true", default=False)
+    parser.add_argument("--use-gpu", action="store_true")
     # distributed
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--dist-backend", type=str, default="")
@@ -1069,22 +1073,36 @@ def run():
         # if the parameter is not set, use the same parameter for training
         args.test_num_workers = args.num_workers
 
-    use_gpu = args.use_gpu and torch.cuda.is_available()
+    # use_gpu = args.use_gpu and torch.cuda.is_available()
+    use_gpu = args.use_gpu and torch.accelerator.is_available() 
+    acc = torch.accelerator.current_accelerator()
+    vendor_backend = torch.distributed.get_default_backend_for_device(acc)
 
     if not args.debug_mode:
+        # ext_dist.init_distributed(
+        #     local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend
+        # )
         ext_dist.init_distributed(
-            local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend
+            local_rank=args.local_rank, use_gpu=use_gpu, backend=vendor_backend
         )
 
     if use_gpu:
-        torch.cuda.manual_seed_all(args.numpy_rand_seed)
-        torch.backends.cudnn.deterministic = True
+        device = torch.accelerator.current_accelerator()
+        # if device.type == "cuda":
+        #     torch.cuda.manual_seed_all(args.numpy_rand_seed)
+        #     torch.backends.cudnn.deterministic = True
+        if device.type == "xpu":
+            torch.xpu.manual_seed_all(args.numpy_rand_seed)
+        
         if ext_dist.my_size > 1:
             ngpus = 1
-            device = torch.device("cuda", ext_dist.my_local_rank)
+            # device = torch.device("cuda", ext_dist.my_local_rank)
+            device = torch.device(f'{acc}', ext_dist.my_local_rank)
         else:
-            ngpus = torch.cuda.device_count()
-            device = torch.device("cuda", 0)
+            # ngpus = torch.cuda.device_count()
+            ngpus = torch.accelerator.device_count()
+            # device = torch.device("cuda", 0)
+            device = torch.device(f'{device}', 0)
         print("Using {} GPU(s)...".format(ngpus))
     else:
         device = torch.device("cpu")
@@ -1323,7 +1341,8 @@ def run():
         else:
             if dlrm.weighted_pooling == "fixed":
                 for k, w in enumerate(dlrm.v_W_l):
-                    dlrm.v_W_l[k] = w.cuda()
+                    # dlrm.v_W_l[k] = w.cuda()
+                    dlrm.v_W_l[k] = w.xpu()
 
     # distribute data parallel mlps
     if ext_dist.my_size > 1:
@@ -1409,7 +1428,8 @@ def run():
                 # note that the call to .to(device) has already happened
                 ld_model = torch.load(
                     args.load_model,
-                    map_location=torch.device("cuda"),
+                    # map_location=torch.device("cuda"),
+                    map_location=torch.device(f'{acc}:{rank}'),
                     # map_location=lambda storage, loc: storage.cuda(0)
                 )
         else:
@@ -1511,8 +1531,10 @@ def run():
 
     ext_dist.barrier()
     with torch.autograd.profiler.profile(
-        args.enable_profiling, use_cuda=use_gpu, record_shapes=True
+        # args.enable_profiling, use_device=use_gpu, record_shapes=True
+        args.enable_profiling, use_kineto=use_gpu, record_shapes=True
     ) as prof:
+    
         if not args.inference_only:
             k = 0
             total_time_begin = 0

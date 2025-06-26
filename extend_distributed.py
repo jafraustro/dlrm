@@ -150,13 +150,17 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
             1,
         )
         if use_gpu:
-            if my_local_size > torch.cuda.device_count():
+            # if my_local_size > torch.cuda.device_count():
+            if my_local_size > torch.accelerator.device_count():
                 print(
                     "Not sufficient GPUs available... local_size = %d, ngpus = %d"
-                    % (my_local_size, torch.cuda.device_count())
+                    # % (my_local_size, torch.cuda.device_count())
+                    % (my_local_size, torch.accelerator.device_count())
                 )
                 sys.exit(1)
-            torch.cuda.set_device(my_local_rank)
+            # torch.cuda.set_device(my_local_rank)
+            torch.accelerator.set_device_index(my_local_rank)
+
         dist.init_process_group(backend, rank=rank, world_size=size)
         my_rank = dist.get_rank()
         my_size = dist.get_world_size()
@@ -166,7 +170,8 @@ def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend="")
             try:
                 t = torch.zeros([4])
                 if use_gpu:
-                    t = t.cuda()
+                    # t = t.cuda()
+                    t = t.to(rank)
                 dist.all_to_all_single(t, t)
                 alltoall_supported = True
             except RuntimeError as err:
